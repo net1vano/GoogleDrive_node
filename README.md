@@ -12,7 +12,7 @@
 2. Установи зависимости:
 
 ```bash
-pip install -r requirements.txt  
+pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
 ```
 
 3. Перезапусти ComfyUI — нода появится в категории **image → upload** под именем **📤 Google Drive Upload**.
@@ -75,6 +75,12 @@ pip install -r requirements.txt
 
 Нода возвращает строку с логом: ссылка на каждый загруженный файл или сообщение об ошибке.
 
+---
+
+## Безопасность
+
+- **Не коммить** `credentials_json` и `gdrive_oauth_token.json` в репозиторий.
+- Добавь в `.gitignore`:
 
 ```
 comfyui_gdrive_upload/gdrive_oauth_token.json
