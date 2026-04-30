@@ -12,11 +12,29 @@ oauth_token_out → STRING нода (буфер токена)
 
 import io
 import json
+import logging
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+# подавить предупреждение file_cache от googleapiclient.discovery
+warnings.filterwarnings("ignore", message="file_cache is only supported with oauth2client")
+logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
+
+# отключить файловый кеш discovery — именно он вызывает предупреждение
+try:
+    import googleapiclient.discovery
+    googleapiclient.discovery.DISCOVERY_URI  # просто проверка импорта
+    import googleapiclient.http
+    # патчим _cache чтобы discovery не пытался писать файл
+    from googleapiclient import discovery as _disc
+    if hasattr(_disc, "_DISCOVERY_CACHE"):
+        _disc._DISCOVERY_CACHE = None
+except Exception:
+    pass
 
 _SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
@@ -66,10 +84,13 @@ def _get_service(client_secret_json: str, cached_token: str):
                 "Откроется браузер — войди в Google (один раз).\n"
                 "Токен появится на выходе oauth_token_out — подключи его к String ноде."
             )
+        print("[GDrive] Открываю браузер для авторизации...")
         flow  = InstalledAppFlow.from_client_config(json.loads(cs), _SCOPES)
         creds = flow.run_local_server(port=0)
+        print("[GDrive] Авторизация успешна")
 
-    return build("drive", "v3", credentials=creds), creds.to_json()
+    print(f"[GDrive] Токен валиден: {creds.valid}, истёк: {creds.expired}")
+    return build("drive", "v3", credentials=creds, cache_discovery=False), creds.to_json()
 
 
 # ── Drive утилиты ──────────────────────────────────────────────────────────
@@ -89,12 +110,14 @@ def _get_or_create_folder(svc, name: str, parent_id: str = None) -> str:
 
 def _upload_bytes(svc, data: bytes, filename: str, folder_id: str) -> str:
     from googleapiclient.http import MediaIoBaseUpload
+    print(f"[GDrive] Загружаю {filename} ({len(data)} байт) в folder_id={folder_id}")
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype="image/png", resumable=True)
     f = svc.files().create(
         body={"name": filename, "parents": [folder_id]},
         media_body=media,
         fields="id,webViewLink",
     ).execute()
+    print(f"[GDrive] Ответ Drive: {f}")
     return f.get("webViewLink") or f.get("id", "?")
 
 
@@ -198,48 +221,68 @@ class GoogleDriveUploadNode:
         try:
             parent_id   = drive_parent_folder_id.strip() or None
             folder_name = drive_folder_name.strip() or "ComfyUI_Uploads"
+            L(f"📁 Ищу/создаю папку '{folder_name}' parent_id={parent_id!r}")
             folder_id   = _get_or_create_folder(svc, folder_name, parent_id)
-            L(f"📁 '{folder_name}' (id={folder_id})")
+            L(f"📁 Папка готова (id={folder_id})")
         except Exception as e:
-            return {"ui": {"text": [f"❌ Папка: {e}"]}, "result": (new_token,)}
+            import traceback
+            err = traceback.format_exc()
+            print(f"[GDrive] ПАПКА ERROR:\n{err}")
+            return {"ui": {"text": [f"❌ Папка: {e}\n{err}"]}, "result": (new_token,)}
 
         ts = int(time.time())
 
         # ══ images tensor ══════════════════════════════════════════════
-        if images is not None:
-            import torch
-            imgs = images
-            if isinstance(imgs, torch.Tensor) and imgs.ndim == 3:
-                imgs = imgs.unsqueeze(0)
-            for i, img in enumerate(imgs):
-                fname = f"{filename_prefix}_{ts}_{i+1:03d}.png"
-                try:
-                    url = _upload_bytes(svc, _tensor_to_png(img), fname, folder_id)
-                    L(f"✅ {fname} → {url}")
-                except Exception as e:
-                    L(f"❌ {fname}: {e}")
-
-        # ══ source_path ════════════════════════════════════════════════
-        elif source_path.strip():
-            p = Path(source_path.strip())
-            if not p.exists():
-                L(f"❌ Путь не найден: {p}")
-            elif p.is_file():
-                try:
-                    L(f"✅ {p.name} → {_upload_file(svc, p, folder_id)}")
-                except Exception as e:
-                    L(f"❌ {p.name}: {e}")
-            elif p.is_dir():
-                files = sorted(f for f in p.iterdir() if f.is_file())
-                if not files:
-                    L("⚠ Папка пустая")
-                for fp in files:
+        try:
+            if images is not None:
+                import torch
+                L(f"🖼 images type={type(images)}, ndim={getattr(images, 'ndim', '?')} shape={getattr(images, 'shape', '?')} dtype={getattr(images, 'dtype', '?')} ")
+                imgs = images
+                if isinstance(imgs, torch.Tensor) and imgs.ndim == 3:
+                    imgs = imgs.unsqueeze(0)
+                L(f"🖼 Батч: {len(imgs)} изображений")
+                for i, img in enumerate(imgs):
+                    fname = f"{filename_prefix}_{ts}_{i+1:03d}.png"
                     try:
-                        L(f"✅ {fp.name} → {_upload_file(svc, fp, folder_id)}")
+                        png = _tensor_to_png(img)
+                        L(f"🖼 {fname} конвертирован в PNG ({len(png)} байт)")
+                        url = _upload_bytes(svc, png, fname, folder_id)
+                        L(f"✅ {fname} → {url}")
                     except Exception as e:
-                        L(f"❌ {fp.name}: {e}")
-        else:
-            L("⚠ Нет входных данных: подключи images или укажи source_path")
+                        import traceback
+                        err = traceback.format_exc()
+                        print(f"[GDrive] UPLOAD ERROR {fname}:\n{err}")
+                        L(f"❌ {fname}: {e}\n{err}")
+
+            # ══ source_path ════════════════════════════════════════════════
+            elif source_path.strip():
+                p = Path(source_path.strip())
+                if not p.exists():
+                    L(f"❌ Путь не найден: {p}")
+                elif p.is_file():
+                    try:
+                        L(f"✅ {p.name} → {_upload_file(svc, p, folder_id)}")
+                    except Exception as e:
+                        import traceback
+                        L(f"❌ {p.name}: {e}\n{traceback.format_exc()}")
+                elif p.is_dir():
+                    files = sorted(f for f in p.iterdir() if f.is_file())
+                    if not files:
+                        L("⚠ Папка пустая")
+                    for fp in files:
+                        try:
+                            L(f"✅ {fp.name} → {_upload_file(svc, fp, folder_id)}")
+                        except Exception as e:
+                            import traceback
+                            L(f"❌ {fp.name}: {e}\n{traceback.format_exc()}")
+            else:
+                L("⚠ Нет входных данных: подключи images или укажи source_path")
+
+        except Exception as e:
+            import traceback
+            err = traceback.format_exc()
+            print(f"[GDrive] НЕОБРАБОТАННАЯ ОШИБКА:\n{err}")
+            L(f"❌ Необработанная ошибка: {e}\n{err}")
 
         return {"ui": {"text": ["\n".join(log)]}, "result": (new_token,)}
 
