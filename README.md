@@ -1,89 +1,106 @@
-# ComfyUI — Google Drive Upload Node
+# 📤 ComfyUI — Google Drive Upload
 
-Нода загружает одно или несколько изображений прямо в папку на Google Drive.
+Нода для загрузки изображений и файлов напрямую на Google Drive через OAuth2.
 
 ---
 
 ## Установка
 
-1. Скопируй папку `comfyui_gdrive_upload` в  
-   `ComfyUI/custom_nodes/comfyui_gdrive_upload/`
-
-2. Установи зависимости:
-
 ```bash
-pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+# 1. Скопируй папку в custom_nodes
+cp -r comfyui_gdrive_upload/ ComfyUI/custom_nodes/
+
+# 2. Установи зависимости
+pip install -r ComfyUI/custom_nodes/comfyui_gdrive_upload/requirements.txt
+
+# 3. Перезапусти ComfyUI
 ```
 
-3. Перезапусти ComfyUI — нода появится в категории **image → upload** под именем **📤 Google Drive Upload**.
+---
+
+## Настройка Google API (один раз)
+
+1. Открой [console.cloud.google.com](https://console.cloud.google.com)
+2. Создай проект → **APIs & Services → Enable APIs** → включи **Google Drive API**
+3. **APIs & Services → Credentials → Create Credentials → OAuth client ID**
+   - Application type: **Desktop app**
+   - Нажми **Create** → скачай `client_secret_*.json`
+4. Если проект в статусе Testing → **OAuth consent screen → Test users** → добавь свой Gmail
 
 ---
 
-## Настройка Google API
+## Первая авторизация
 
-Выбери один из двух способов авторизации.
+1. Открой скачанный `client_secret_*.json` в текстовом редакторе
+2. Скопируй **всё содержимое** и вставь в поле `client_secret_json` ноды
+3. Запусти граф — откроется браузер, войди в Google и разреши доступ
+4. Токен появится на выходе `oauth_token_out`
+5. Подключи `oauth_token_out` к ноде **String** (Text Multiline или аналог)
+6. Выход String ноды подключи обратно на вход `oauth_token_in`
+7. Сохрани воркфлоу `Ctrl+S` — токен теперь хранится внутри воркфлоу
+8. Очисти поле `client_secret_json` — оно больше не нужно
 
----
-
-### Способ 1 — Service Account (рекомендуется для автоматизации)
-
-Подходит, если нужна работа без браузера/человека.
-
-1. Открой [console.cloud.google.com](https://console.cloud.google.com).
-2. Создай проект (или выбери существующий).
-3. **APIs & Services → Enable APIs** → найди и включи **Google Drive API**.
-4. **APIs & Services → Credentials → Create Credentials → Service account**.
-5. Задай имя, нажми **Done**.
-6. В списке сервисных аккаунтов нажми на созданный → вкладка **Keys → Add Key → JSON**.
-7. Скачается файл вида `my-project-XXXX.json` — это и есть ключ.
-8. Открой файл в текстовом редакторе, **скопируй всё содержимое** и вставь в поле `credentials_json` ноды.
-9. В поле `auth_mode` выбери **service_account**.
-
-> ⚠️ Сервисный аккаунт работает в своём Drive-пространстве.  
-> Чтобы загрузки попадали **в твой** Google Drive — открой нужную папку и выдай сервисному аккаунту доступ:  
-> **Поделиться → вставь email сервисного аккаунта** (вида `name@project.iam.gserviceaccount.com`) → роль **Editor**.  
-> Затем скопируй ID этой папки из URL (`https://drive.google.com/drive/folders/**ВОТ_ЭТО**`) и вставь в поле `parent_folder_id`.
+```
+[String / Text node] ◄─── oauth_token_out
+        │
+        └──────────────► oauth_token_in  [📤 Google Drive Upload]
+                                                  │
+                          [Load Image] ──images───┘
+```
 
 ---
 
-### Способ 2 — OAuth2 (файл client_secret)
+## Передача воркфлоу другому человеку
 
-Подходит, если хочешь загружать прямо в свой Drive без расшаривания.
+Токен хранится прямо в String ноде внутри `.json` файла воркфлоу.  
+Передай воркфлоу — авторизация уже внутри, браузер открываться не будет.  
+Файлы будут загружаться в **твой** Google Drive.
 
-1. В Google Cloud Console: **APIs & Services → Credentials → Create Credentials → OAuth client ID**.
-2. Application type: **Desktop app** → придумай имя → **Create**.
-3. Нажми **Download JSON** — скачается `client_secret_XXXX.json`.
-4. Открой файл, **скопируй всё содержимое** и вставь в `credentials_json`.
-5. В поле `auth_mode` выбери **oauth2**.
-6. При первом запуске ноды откроется браузер — войди в Google и разреши доступ.  
-   Токен кешируется в `comfyui_gdrive_upload/gdrive_oauth_token.json`, повторный вход не нужен.
-
-> Если в Google Cloud Console проект ещё в стадии «Testing», добавь свой Google-аккаунт в **Test users** (OAuth consent screen → Test users).
+Отозвать доступ можно в любой момент:  
+[myaccount.google.com/permissions](https://myaccount.google.com/permissions) → найди приложение → **Remove Access**
 
 ---
 
 ## Параметры ноды
 
-| Параметр | Описание |
-|---|---|
-| **images** | Вход: одно изображение или батч из IMAGE |
-| **folder_name** | Имя папки на Drive. Будет создана автоматически, если не существует |
-| **auth_mode** | `service_account` или `oauth2` |
-| **credentials_json** | Содержимое JSON-ключа (полностью) |
-| **filename_prefix** | Префикс имени файла, например `result` → `result_1700000000_001.png` |
-| **parent_folder_id** | ID родительской папки на Drive (опционально) |
+| Параметр | Тип | Описание |
+|---|---|---|
+| `client_secret_json` | STRING | Содержимое `client_secret_*.json`. Только для первой авторизации, потом очистить |
+| `oauth_token_in` | STRING (optional) | Вход токена из String ноды. Если не подключён — нужен `client_secret_json` |
+| `drive_folder_name` | STRING | Имя папки на Google Drive. Создаётся автоматически если не существует |
+| `drive_parent_folder_id` | STRING | ID родительской папки (опционально). Из URL: `drive.google.com/drive/folders/`**`ВОТ_ЭТО`** |
+| `images` | IMAGE (optional) | Изображения из ComfyUI. Одно или батч |
+| `source_path` | STRING (optional) | Путь к локальному файлу или папке. Папка — все файлы по очереди |
+| `filename_prefix` | STRING | Префикс имени файла при загрузке из `images`. Пример: `result` → `result_1700000000_001.png` |
+| `oauth_token_out` | STRING (output) | Актуальный токен. Подключить к String ноде для хранения |
 
-Нода возвращает строку с логом: ссылка на каждый загруженный файл или сообщение об ошибке.
+> Нужен хотя бы один из источников: `images` или `source_path`
+
+---
+
+## Использование drive_parent_folder_id
+
+Google Drive API не позволяет сервисным аккаунтам загружать в чужое хранилище.  
+При использовании OAuth2 это ограничение снято — файлы загружаются на твой личный Drive.
+
+Если хочешь загружать в конкретную папку:
+1. Открой нужную папку в Google Drive
+2. Скопируй ID из URL: `https://drive.google.com/drive/folders/`**`1AbCdEfGhIjKlMn`**
+3. Вставь в поле `drive_parent_folder_id`
+4. Папка `drive_folder_name` будет создана внутри неё
+
+---
+
+## Обновление токена
+
+Токен обновляется автоматически при каждом запуске если истёк.  
+Актуальная версия выходит из `oauth_token_out` и обновляет String ноду.  
+Повторная авторизация через браузер не требуется — `refresh_token` бессрочный.
 
 ---
 
 ## Безопасность
 
-- **Не коммить** `credentials_json` и `gdrive_oauth_token.json` в репозиторий.
-- Добавь в `.gitignore`:
-
-```
-comfyui_gdrive_upload/gdrive_oauth_token.json
-```
-
-- Service Account ключ храни в безопасном месте — он даёт доступ к Drive без пароля.
+- `client_secret_json` — очисти после первой авторизации
+- `oauth_token_in` даёт доступ только к файлам созданным этим приложением (`drive.file` scope), не ко всему Drive
+- Не публикуй воркфлоу с токеном в открытый доступ
