@@ -2,28 +2,43 @@
 ComfyUI Google Drive Upload Node
 Uploads generated images directly to a Google Drive folder via API.
 
-Supports two auth methods:
-  1. Service Account JSON key  (recommended for automation)
-  2. OAuth2 Client credentials (user-consent flow, token cached locally)
+Auth modes:
+  1. Service Account JSON key  – paste JSON, no browser needed
+  2. OAuth2                    – click "Authorize" button in the node UI
 """
 
 import io
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+_HERE = Path(__file__).parent
+_TOKEN_CACHE = _HERE / "gdrive_oauth_token.json"
+_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
+# In-memory auth state shared between HTTP handlers and node execution
+_auth_state = {
+    "status": "unknown",   # "unknown" | "authorized" | "error"
+    "email": "",
+    "error": "",
+}
+_auth_state_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
-# Lazy imports so the node loads even if google libs are not installed yet.
-# A clear error is shown inside the node execution instead of at startup.
+# Lazy Google imports
 # ---------------------------------------------------------------------------
 
 def _import_google_libs():
-    """Return (build_func, Credentials classes) or raise ImportError with hint."""
     try:
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaIoBaseUpload
@@ -31,77 +46,125 @@ def _import_google_libs():
         from google.oauth2.credentials import Credentials
         from google_auth_oauthlib.flow import InstalledAppFlow
         from google.auth.transport.requests import Request
-        return build, MediaIoBaseUpload, service_account, Credentials, InstalledAppFlow, Request
+        return (build, MediaIoBaseUpload, service_account,
+                Credentials, InstalledAppFlow, Request)
     except ImportError as e:
         raise ImportError(
             f"Google API libraries not found: {e}\n"
-            "Install them with:\n"
-            "  pip install google-api-python-client google-auth-httplib2 "
-            "google-auth-oauthlib"
+            "Run: pip install google-api-python-client "
+            "google-auth-httplib2 google-auth-oauthlib"
         ) from e
 
 
-# OAuth2 token cache location (next to this file)
-_TOKEN_CACHE = Path(__file__).parent / "gdrive_oauth_token.json"
-_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-
-
 # ---------------------------------------------------------------------------
-# Helper utilities
+# Auth helpers
 # ---------------------------------------------------------------------------
 
-def _tensor_to_pil(tensor) -> Image.Image:
-    """Convert a ComfyUI image tensor (H,W,3) float32 [0-1] to PIL Image."""
-    array = (tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-    return Image.fromarray(array, "RGB")
-
-
-def _build_service_from_service_account(json_key: str):
-    """Authenticate with a Service Account JSON key string."""
+def _build_service_account(json_key: str):
     build, MediaIoBaseUpload, service_account, *_ = _import_google_libs()
     info = json.loads(json_key)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=_SCOPES)
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=_SCOPES
+    )
     return build("drive", "v3", credentials=creds), MediaIoBaseUpload
 
 
-def _build_service_from_oauth(client_secret_json: str):
-    """Authenticate with OAuth2 (opens browser on first run, caches token)."""
-    build, MediaIoBaseUpload, _, Credentials, InstalledAppFlow, Request = _import_google_libs()
+def _build_oauth_from_cache():
+    """Build Drive service from cached OAuth token. Raises if no valid cache."""
+    build, MediaIoBaseUpload, _, Credentials, _flow, Request = _import_google_libs()
 
-    creds = None
-    if _TOKEN_CACHE.exists():
-        creds = Credentials.from_authorized_user_file(str(_TOKEN_CACHE), _SCOPES)
+    if not _TOKEN_CACHE.exists():
+        raise FileNotFoundError("No cached OAuth token. Please authorize first.")
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            client_config = json.loads(client_secret_json)
-            flow = InstalledAppFlow.from_client_config(client_config, _SCOPES)
-            creds = flow.run_local_server(port=0)
+    creds = Credentials.from_authorized_user_file(str(_TOKEN_CACHE), _SCOPES)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
         _TOKEN_CACHE.write_text(creds.to_json())
 
+    if not creds.valid:
+        raise ValueError("Cached token is invalid. Please re-authorize.")
+
     return build("drive", "v3", credentials=creds), MediaIoBaseUpload
 
 
-def _get_or_create_folder(service, folder_name: str, parent_id: str = None) -> str:
-    """Return the Drive folder ID, creating the folder if it doesn't exist."""
+def _do_oauth_flow(client_secret_json: str):
+    """Run OAuth2 InstalledApp flow, cache token, update _auth_state."""
+    build, _, __, ___, InstalledAppFlow, ____ = _import_google_libs()
+
+    client_config = json.loads(client_secret_json)
+    flow = InstalledAppFlow.from_client_config(client_config, _SCOPES)
+    creds = flow.run_local_server(port=0)
+    _TOKEN_CACHE.write_text(creds.to_json())
+
+    try:
+        svc = build("oauth2", "v2", credentials=creds)
+        info = svc.userinfo().get().execute()
+        email = info.get("email", "")
+    except Exception:
+        email = ""
+
+    with _auth_state_lock:
+        _auth_state["status"] = "authorized"
+        _auth_state["email"] = email
+        _auth_state["error"] = ""
+
+
+def _check_cached_token_status():
+    """Refresh _auth_state from cached token (no browser)."""
+    try:
+        build, _, __, Credentials, _flow, Request = _import_google_libs()
+
+        if not _TOKEN_CACHE.exists():
+            with _auth_state_lock:
+                _auth_state["status"] = "unknown"
+                _auth_state["email"] = ""
+            return
+
+        creds = Credentials.from_authorized_user_file(str(_TOKEN_CACHE), _SCOPES)
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            _TOKEN_CACHE.write_text(creds.to_json())
+
+        if creds.valid:
+            try:
+                svc = build("oauth2", "v2", credentials=creds)
+                info = svc.userinfo().get().execute()
+                email = info.get("email", "")
+            except Exception:
+                email = ""
+            with _auth_state_lock:
+                _auth_state["status"] = "authorized"
+                _auth_state["email"] = email
+                _auth_state["error"] = ""
+        else:
+            with _auth_state_lock:
+                _auth_state["status"] = "unknown"
+                _auth_state["email"] = ""
+    except Exception:
+        with _auth_state_lock:
+            _auth_state["status"] = "unknown"
+            _auth_state["email"] = ""
+
+
+# ---------------------------------------------------------------------------
+# Drive utilities
+# ---------------------------------------------------------------------------
+
+def _get_or_create_folder(service, folder_name: str, parent_id=None) -> str:
     query = (
-        f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' "
-        f"and trashed=false"
+        f"name='{folder_name}' and "
+        "mimeType='application/vnd.google-apps.folder' and trashed=false"
     )
     if parent_id:
         query += f" and '{parent_id}' in parents"
 
-    results = service.files().list(q=query, fields="files(id, name)").execute()
+    results = service.files().list(q=query, fields="files(id)").execute()
     files = results.get("files", [])
     if files:
         return files[0]["id"]
 
-    metadata = {
-        "name": folder_name,
-        "mimeType": "application/vnd.google-apps.folder",
-    }
+    metadata = {"name": folder_name,
+                "mimeType": "application/vnd.google-apps.folder"}
     if parent_id:
         metadata["parents"] = [parent_id]
 
@@ -109,19 +172,88 @@ def _get_or_create_folder(service, folder_name: str, parent_id: str = None) -> s
     return folder["id"]
 
 
-def _upload_image(service, MediaIoBaseUpload, image_bytes: bytes,
-                  filename: str, folder_id: str) -> str:
-    """Upload PNG bytes to Drive, return the file URL."""
+def _upload_image(service, MediaIoBaseUpload,
+                  image_bytes: bytes, filename: str, folder_id: str) -> str:
     file_metadata = {"name": filename, "parents": [folder_id]}
     media = MediaIoBaseUpload(
         io.BytesIO(image_bytes), mimetype="image/png", resumable=True
     )
     uploaded = (
         service.files()
-        .create(body=file_metadata, media_body=media, fields="id, webViewLink")
+        .create(body=file_metadata, media_body=media, fields="id,webViewLink")
         .execute()
     )
     return uploaded.get("webViewLink", uploaded.get("id", "unknown"))
+
+
+def _tensor_to_pil(tensor) -> Image.Image:
+    array = (tensor.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(array, "RGB")
+
+
+# ---------------------------------------------------------------------------
+# HTTP API endpoints
+# ---------------------------------------------------------------------------
+
+def _register_routes():
+    try:
+        from aiohttp import web
+        from server import PromptServer
+
+        routes = PromptServer.instance.routes
+
+        @routes.get("/gdrive/auth_status")
+        async def auth_status(_req):
+            _check_cached_token_status()
+            with _auth_state_lock:
+                state = dict(_auth_state)
+            return web.json_response(state)
+
+        @routes.post("/gdrive/authorize")
+        async def authorize(req: web.Request):
+            try:
+                body = await req.json()
+                client_secret_json = body.get("credentials_json", "").strip()
+                if not client_secret_json:
+                    return web.json_response(
+                        {"ok": False, "error": "credentials_json is empty"}, status=400
+                    )
+
+                def _run():
+                    try:
+                        _do_oauth_flow(client_secret_json)
+                    except Exception as e:
+                        with _auth_state_lock:
+                            _auth_state["status"] = "error"
+                            _auth_state["error"] = str(e)
+
+                threading.Thread(target=_run, daemon=True).start()
+                return web.json_response(
+                    {"ok": True,
+                     "message": "Browser window opened – complete sign-in there."}
+                )
+            except Exception as e:
+                return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+        @routes.post("/gdrive/revoke")
+        async def revoke(_req):
+            try:
+                if _TOKEN_CACHE.exists():
+                    _TOKEN_CACHE.unlink()
+                with _auth_state_lock:
+                    _auth_state["status"] = "unknown"
+                    _auth_state["email"] = ""
+                    _auth_state["error"] = ""
+                return web.json_response({"ok": True})
+            except Exception as e:
+                return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    except Exception as e:
+        print(f"[GDriveUpload] Could not register routes: {e}")
+
+
+_register_routes()
+_check_cached_token_status()
 
 
 # ---------------------------------------------------------------------------
@@ -129,16 +261,6 @@ def _upload_image(service, MediaIoBaseUpload, image_bytes: bytes,
 # ---------------------------------------------------------------------------
 
 class GoogleDriveUploadNode:
-    """
-    ComfyUI node that uploads one or more images to a Google Drive folder.
-
-    Auth modes
-    ----------
-    service_account  – Paste the full contents of a Service Account JSON key.
-    oauth2           – Paste the full contents of an OAuth2 client_secret JSON.
-                       A browser window opens on the first run; token is cached.
-    """
-
     CATEGORY = "image/upload"
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("upload_log",)
@@ -152,32 +274,21 @@ class GoogleDriveUploadNode:
                 "images": ("IMAGE",),
                 "folder_name": (
                     "STRING",
-                    {
-                        "default": "ComfyUI_Results",
-                        "multiline": False,
-                        "tooltip": "Drive folder name (will be created if absent)",
-                    },
+                    {"default": "ComfyUI_Results", "multiline": False},
                 ),
                 "auth_mode": (
-                    ["service_account", "oauth2"],
-                    {
-                        "default": "service_account",
-                        "tooltip": (
-                            "service_account: paste Service Account JSON key below.\n"
-                            "oauth2: paste OAuth2 client_secret JSON below "
-                            "(browser opens on first run)."
-                        ),
-                    },
+                    ["oauth2", "service_account"],
+                    {"default": "oauth2"},
                 ),
                 "credentials_json": (
                     "STRING",
                     {
                         "default": "",
                         "multiline": True,
+                        "password": True,
                         "tooltip": (
-                            "Paste the full JSON key here.\n"
-                            "Service Account: contents of the downloaded .json key file.\n"
-                            "OAuth2: contents of the client_secret_*.json file."
+                            "oauth2: paste client_secret_*.json, then click Authorize.\n"
+                            "service_account: paste Service Account JSON key."
                         ),
                     },
                 ),
@@ -185,80 +296,56 @@ class GoogleDriveUploadNode:
             "optional": {
                 "filename_prefix": (
                     "STRING",
-                    {
-                        "default": "image",
-                        "multiline": False,
-                        "tooltip": "Prefix for uploaded filenames, e.g. 'image' → image_001.png",
-                    },
+                    {"default": "image", "multiline": False},
                 ),
                 "parent_folder_id": (
                     "STRING",
-                    {
-                        "default": "",
-                        "multiline": False,
-                        "tooltip": (
-                            "Optional: Drive folder ID of a parent folder.\n"
-                            "Leave empty to create the folder at Drive root."
-                        ),
-                    },
+                    {"default": "", "multiline": False},
                 ),
             },
         }
 
-    # ------------------------------------------------------------------
-
     def upload_images(
-            self,
-            images,
-            folder_name: str,
-            auth_mode: str,
-            credentials_json: str,
-            filename_prefix: str = "image",
-            parent_folder_id: str = "",
+        self,
+        images,
+        folder_name: str,
+        auth_mode: str,
+        credentials_json: str,
+        filename_prefix: str = "image",
+        parent_folder_id: str = "",
     ):
         credentials_json = credentials_json.strip()
-        if not credentials_json:
-            msg = "❌ credentials_json is empty – paste your JSON key in the node."
-            print(f"[GDriveUpload] {msg}")
-            return (msg,)
 
-        # ---- Authenticate ------------------------------------------------
         try:
             if auth_mode == "service_account":
-                service, MediaIoBaseUpload = _build_service_from_service_account(
-                    credentials_json
-                )
+                if not credentials_json:
+                    return ("❌ Paste your Service Account JSON key into credentials_json.",)
+                service, MediaIoBaseUpload = _build_service_account(credentials_json)
             else:
-                service, MediaIoBaseUpload = _build_service_from_oauth(
-                    credentials_json
-                )
+                try:
+                    service, MediaIoBaseUpload = _build_oauth_from_cache()
+                except Exception as e:
+                    return (
+                        f"❌ OAuth2: {e}\n"
+                        "Paste client_secret JSON and click Authorize in the node.",
+                    )
         except ImportError as e:
-            msg = f"❌ Import error: {e}"
-            print(f"[GDriveUpload] {msg}")
-            return (msg,)
+            return (f"❌ Import error: {e}",)
         except Exception as e:
-            msg = f"❌ Auth failed: {e}"
-            print(f"[GDriveUpload] {msg}")
-            return (msg,)
+            return (f"❌ Auth failed: {e}",)
 
-        # ---- Resolve / create target folder ------------------------------
         try:
             pid = parent_folder_id.strip() or None
             folder_id = _get_or_create_folder(service, folder_name, pid)
         except Exception as e:
-            msg = f"❌ Folder error: {e}"
-            print(f"[GDriveUpload] {msg}")
-            return (msg,)
+            return (f"❌ Folder error: {e}",)
 
-        # ---- Upload each image -------------------------------------------
-        # `images` can be a single tensor (H,W,3) or a batch (N,H,W,3).
         import torch
         if isinstance(images, torch.Tensor):
             if images.ndim == 3:
-                images = images.unsqueeze(0)  # add batch dim
+                images = images.unsqueeze(0)
         else:
-            # fallback: wrap in list
-            images = [images]
+            images = list(images)
 
         timestamp = int(time.time())
         log_lines = []
@@ -267,33 +354,25 @@ class GoogleDriveUploadNode:
             pil_img = _tensor_to_pil(img_tensor)
             buf = io.BytesIO()
             pil_img.save(buf, format="PNG")
-            png_bytes = buf.getvalue()
 
             filename = f"{filename_prefix}_{timestamp}_{idx + 1:03d}.png"
-
             try:
                 url = _upload_image(
-                    service, MediaIoBaseUpload, png_bytes, filename, folder_id
+                    service, MediaIoBaseUpload, buf.getvalue(), filename, folder_id
                 )
                 line = f"✅ {filename} → {url}"
             except Exception as e:
-                line = f"❌ {filename} upload failed: {e}"
+                line = f"❌ {filename}: {e}"
 
             print(f"[GDriveUpload] {line}")
             log_lines.append(line)
 
-        result = "\n".join(log_lines)
-        return (result,)
+        return ("\n".join(log_lines),)
 
 
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
-NODE_CLASS_MAPPINGS = {
-    "GoogleDriveUpload": GoogleDriveUploadNode,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "GoogleDriveUpload": "📤 Google Drive Upload",
-}
+NODE_CLASS_MAPPINGS = {"GoogleDriveUpload": GoogleDriveUploadNode}
+NODE_DISPLAY_NAME_MAPPINGS = {"GoogleDriveUpload": "📤 Google Drive Upload"}
