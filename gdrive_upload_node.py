@@ -185,8 +185,14 @@ class GoogleDriveUploadNode:
                 "images": ("IMAGE", {}),
                 "source_path": ("STRING", {
                     "default": "",
-                    "multiline": False,
-                    "tooltip": "Путь к файлу или папке. Папка — все файлы по очереди.",
+                    "multiline": True,
+                    "forceInput": True,
+                    "tooltip": (
+                        "Принимает:\n"
+                        "  • одиночный путь: /data/output/img.jpg\n"
+                        "  • JSON-список: [\"/data/a.jpg\", \"/data/b.jpg\"]\n"
+                        "  • путь к папке: все файлы внутри загружаются по очереди"
+                    ),
                 }),
                 "filename_prefix": ("STRING", {
                     "default": "image",
@@ -256,25 +262,43 @@ class GoogleDriveUploadNode:
 
             # ══ source_path ════════════════════════════════════════════════
             elif source_path.strip():
-                p = Path(source_path.strip())
-                if not p.exists():
-                    L(f"❌ Путь не найден: {p}")
-                elif p.is_file():
+                # разобрать вход: JSON-список, одиночный путь или папка
+                raw = source_path.strip()
+                paths_to_upload = []
+
+                # попытка распарсить как JSON
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        paths_to_upload = [Path(p) for p in parsed]
+                    elif isinstance(parsed, str):
+                        paths_to_upload = [Path(parsed)]
+                    else:
+                        paths_to_upload = [Path(raw)]
+                except (json.JSONDecodeError, ValueError):
+                    # не JSON — одиночный путь или папка
+                    p = Path(raw)
+                    if p.is_dir():
+                        paths_to_upload = sorted(f for f in p.iterdir() if f.is_file())
+                    else:
+                        paths_to_upload = [p]
+
+                L(f"📋 Файлов для загрузки: {len(paths_to_upload)}")
+
+                for fp in paths_to_upload:
+                    fp = Path(fp)
+                    if not fp.exists():
+                        L(f"❌ Файл не найден: {fp}")
+                        continue
+                    if not fp.is_file():
+                        L(f"⚠ Пропуск (не файл): {fp}")
+                        continue
                     try:
-                        L(f"✅ {p.name} → {_upload_file(svc, p, folder_id)}")
+                        url = _upload_file(svc, fp, folder_id)
+                        L(f"✅ {fp.name} → {url}")
                     except Exception as e:
                         import traceback
-                        L(f"❌ {p.name}: {e}\n{traceback.format_exc()}")
-                elif p.is_dir():
-                    files = sorted(f for f in p.iterdir() if f.is_file())
-                    if not files:
-                        L("⚠ Папка пустая")
-                    for fp in files:
-                        try:
-                            L(f"✅ {fp.name} → {_upload_file(svc, fp, folder_id)}")
-                        except Exception as e:
-                            import traceback
-                            L(f"❌ {fp.name}: {e}\n{traceback.format_exc()}")
+                        L(f"❌ {fp.name}: {e}\n{traceback.format_exc()}")
             else:
                 L("⚠ Нет входных данных: подключи images или укажи source_path")
 
