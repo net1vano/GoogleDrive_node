@@ -208,13 +208,21 @@ class GoogleDriveUploadNode:
         drive_parent_folder_id: str,
         oauth_token_in: str = "",
         images=None,
-        source_path: str = "",
+        source_path=None,
         filename_prefix: str = "image",
     ):
         log = []
         def L(msg):
             print(f"[GDrive] {msg}")
             log.append(msg)
+
+        # нормализуем source_path — ComfyUI может прислать str, list или None
+        if source_path is None:
+            source_path = []
+        elif isinstance(source_path, list):
+            pass  # уже список путей
+        else:
+            source_path = str(source_path)
 
         # ── авторизация ────────────────────────────────────────────────
         try:
@@ -261,27 +269,31 @@ class GoogleDriveUploadNode:
                         L(f"❌ {fname}: {e}\n{err}")
 
             # ══ source_path ════════════════════════════════════════════════
-            elif source_path.strip():
-                # разобрать вход: JSON-список, одиночный путь или папка
-                raw = source_path.strip()
+            elif source_path:
                 paths_to_upload = []
 
-                # попытка распарсить как JSON
-                try:
-                    parsed = json.loads(raw)
-                    if isinstance(parsed, list):
-                        paths_to_upload = [Path(p) for p in parsed]
-                    elif isinstance(parsed, str):
-                        paths_to_upload = [Path(parsed)]
-                    else:
-                        paths_to_upload = [Path(raw)]
-                except (json.JSONDecodeError, ValueError):
-                    # не JSON — одиночный путь или папка
-                    p = Path(raw)
-                    if p.is_dir():
-                        paths_to_upload = sorted(f for f in p.iterdir() if f.is_file())
-                    else:
-                        paths_to_upload = [p]
+                if isinstance(source_path, list):
+                    # ComfyUI передал уже готовый list (напр. выход files ноды)
+                    paths_to_upload = [Path(p) for p in source_path]
+
+                elif isinstance(source_path, str) and source_path.strip():
+                    raw = source_path.strip()
+                    # попытка распарсить как JSON-строку
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, list):
+                            paths_to_upload = [Path(p) for p in parsed]
+                        elif isinstance(parsed, str):
+                            paths_to_upload = [Path(parsed)]
+                        else:
+                            paths_to_upload = [Path(raw)]
+                    except (json.JSONDecodeError, ValueError):
+                        # обычный путь к файлу или папке
+                        p = Path(raw)
+                        if p.is_dir():
+                            paths_to_upload = sorted(f for f in p.iterdir() if f.is_file())
+                        else:
+                            paths_to_upload = [p]
 
                 L(f"📋 Файлов для загрузки: {len(paths_to_upload)}")
 
