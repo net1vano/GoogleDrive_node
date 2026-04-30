@@ -1,13 +1,5 @@
 """
 ComfyUI – Google Drive Upload
-==============================
-oauth_token_in  ← STRING нода (буфер токена)
-oauth_token_out → STRING нода (буфер токена)
-
-Первый запуск: вставить client_secret_json → браузер → токен появится на выходе
-               → сохранить в String ноду → подать обратно на вход.
-Следующие запуски: токен читается со входа, обновляется если истёк,
-                   актуальная версия выходит снова.
 """
 
 import io
@@ -20,26 +12,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-# подавить предупреждение file_cache от googleapiclient.discovery
 warnings.filterwarnings("ignore", message="file_cache is only supported with oauth2client")
 logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
-
-# отключить файловый кеш discovery — именно он вызывает предупреждение
-try:
-    import googleapiclient.discovery
-    googleapiclient.discovery.DISCOVERY_URI  # просто проверка импорта
-    import googleapiclient.http
-    # патчим _cache чтобы discovery не пытался писать файл
-    from googleapiclient import discovery as _disc
-    if hasattr(_disc, "_DISCOVERY_CACHE"):
-        _disc._DISCOVERY_CACHE = None
-except Exception:
-    pass
 
 _SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 
-# ── lazy imports ───────────────────────────────────────────────────────────
 def _google():
     try:
         from googleapiclient.discovery import build
@@ -54,18 +32,13 @@ def _google():
         ) from e
 
 
-# ── авторизация ────────────────────────────────────────────────────────────
 def _get_service(client_secret_json: str, cached_token: str):
-    """Возвращает (service, актуальный_token_json)."""
     build, Credentials, InstalledAppFlow, Request = _google()
-
     creds = None
 
     if cached_token.strip():
         try:
-            creds = Credentials.from_authorized_user_info(
-                json.loads(cached_token), _SCOPES
-            )
+            creds = Credentials.from_authorized_user_info(json.loads(cached_token), _SCOPES)
         except Exception:
             creds = None
 
@@ -93,8 +66,7 @@ def _get_service(client_secret_json: str, cached_token: str):
     return build("drive", "v3", credentials=creds, cache_discovery=False), creds.to_json()
 
 
-# ── Drive утилиты ──────────────────────────────────────────────────────────
-def _get_or_create_folder(svc, name: str, parent_id: str = None) -> str:
+def _get_or_create_folder(svc, name: str, parent_id=None) -> str:
     safe = name.replace("'", "\\'")
     q    = f"name='{safe}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
     if parent_id:
@@ -110,14 +82,13 @@ def _get_or_create_folder(svc, name: str, parent_id: str = None) -> str:
 
 def _upload_bytes(svc, data: bytes, filename: str, folder_id: str) -> str:
     from googleapiclient.http import MediaIoBaseUpload
-    print(f"[GDrive] Загружаю {filename} ({len(data)} байт) в folder_id={folder_id}")
+    print(f"[GDrive] Загружаю {filename} ({len(data)} байт) folder_id={folder_id}")
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype="image/png", resumable=True)
     f = svc.files().create(
         body={"name": filename, "parents": [folder_id]},
         media_body=media,
         fields="id,webViewLink",
     ).execute()
-    print(f"[GDrive] Ответ Drive: {f}")
     return f.get("webViewLink") or f.get("id", "?")
 
 
@@ -126,7 +97,8 @@ def _upload_file(svc, filepath: Path, folder_id: str) -> str:
     from googleapiclient.http import MediaFileUpload
     mime, _ = mimetypes.guess_type(str(filepath))
     mime     = mime or "application/octet-stream"
-    media    = MediaFileUpload(str(filepath), mimetype=mime, resumable=True)
+    print(f"[GDrive] Загружаю файл {filepath.name} ({mime}) folder_id={folder_id}")
+    media = MediaFileUpload(str(filepath), mimetype=mime, resumable=True)
     f = svc.files().create(
         body={"name": filepath.name, "parents": [folder_id]},
         media_body=media,
@@ -142,7 +114,41 @@ def _tensor_to_png(tensor) -> bytes:
     return buf.getvalue()
 
 
-# ── нода ──────────────────────────────────────────────────────────────────
+def _resolve_paths(source_path) -> list:
+    """
+    Принимает любой формат source_path и возвращает список Path.
+      - list  → уже готовый список
+      - str с JSON  → парсит
+      - str путь к файлу  → [файл]
+      - str путь к папке  → все файлы внутри
+      - None / ""  → []
+    """
+    if not source_path:
+        return []
+
+    if isinstance(source_path, list):
+        return [Path(p) for p in source_path if p]
+
+    if isinstance(source_path, str):
+        raw = source_path.strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [Path(p) for p in parsed if p]
+            if isinstance(parsed, str):
+                return [Path(parsed)]
+        except (json.JSONDecodeError, ValueError):
+            pass
+        p = Path(raw)
+        if p.is_dir():
+            return sorted(f for f in p.iterdir() if f.is_file())
+        return [p]
+
+    return []
+
+
 class GoogleDriveUploadNode:
     CATEGORY     = "image/upload"
     RETURN_TYPES = ("STRING",)
@@ -157,12 +163,7 @@ class GoogleDriveUploadNode:
                 "client_secret_json": ("STRING", {
                     "default": "",
                     "multiline": False,
-                    "tooltip": (
-                        "Только для первой авторизации: содержимое client_secret_*.json.\n"
-                        "После первого запуска токен выйдет из oauth_token_out —\n"
-                        "подключи его к String ноде и обратно на oauth_token_in.\n"
-                        "Затем это поле можно очистить."
-                    ),
+                    "tooltip": "Только для первой авторизации: содержимое client_secret_*.json.",
                 }),
                 "drive_folder_name": ("STRING", {
                     "default": "ComfyUI_Uploads",
@@ -177,22 +178,12 @@ class GoogleDriveUploadNode:
             "optional": {
                 "oauth_token_in": ("STRING", {
                     "forceInput": True,
-                    "tooltip": (
-                        "Подключи String ноду с сохранённым токеном.\n"
-                        "Если не подключено — нужен client_secret_json для авторизации."
-                    ),
+                    "tooltip": "Подключи String ноду с сохранённым токеном.",
                 }),
                 "images": ("IMAGE", {}),
                 "source_path": ("STRING", {
-                    "default": "",
-                    "multiline": True,
                     "forceInput": True,
-                    "tooltip": (
-                        "Принимает:\n"
-                        "  • одиночный путь: /data/output/img.jpg\n"
-                        "  • JSON-список: [\"/data/a.jpg\", \"/data/b.jpg\"]\n"
-                        "  • путь к папке: все файлы внутри загружаются по очереди"
-                    ),
+                    "tooltip": "Путь к файлу, папке или JSON-список путей.",
                 }),
                 "filename_prefix": ("STRING", {
                     "default": "image",
@@ -206,7 +197,7 @@ class GoogleDriveUploadNode:
         client_secret_json: str,
         drive_folder_name: str,
         drive_parent_folder_id: str,
-        oauth_token_in: str = "",
+        oauth_token_in=None,
         images=None,
         source_path=None,
         filename_prefix: str = "image",
@@ -216,41 +207,30 @@ class GoogleDriveUploadNode:
             print(f"[GDrive] {msg}")
             log.append(msg)
 
-        # нормализуем source_path — ComfyUI может прислать str, list или None
-        if source_path is None:
-            source_path = []
-        elif isinstance(source_path, list):
-            pass  # уже список путей
-        else:
-            source_path = str(source_path)
-
-        # ── авторизация ────────────────────────────────────────────────
+        # авторизация
         try:
             svc, new_token = _get_service(client_secret_json, oauth_token_in or "")
             L("🔑 Авторизован")
         except Exception as e:
             return {"ui": {"text": [f"❌ Авторизация: {e}"]}, "result": ("",)}
 
-        # ── папка ──────────────────────────────────────────────────────
+        # папка
         try:
-            parent_id   = drive_parent_folder_id.strip() or None
-            folder_name = drive_folder_name.strip() or "ComfyUI_Uploads"
+            parent_id   = (drive_parent_folder_id or "").strip() or None
+            folder_name = (drive_folder_name or "").strip() or "ComfyUI_Uploads"
             L(f"📁 Ищу/создаю папку '{folder_name}' parent_id={parent_id!r}")
-            folder_id   = _get_or_create_folder(svc, folder_name, parent_id)
+            folder_id = _get_or_create_folder(svc, folder_name, parent_id)
             L(f"📁 Папка готова (id={folder_id})")
         except Exception as e:
             import traceback
-            err = traceback.format_exc()
-            print(f"[GDrive] ПАПКА ERROR:\n{err}")
-            return {"ui": {"text": [f"❌ Папка: {e}\n{err}"]}, "result": (new_token,)}
+            return {"ui": {"text": [f"❌ Папка: {e}\n{traceback.format_exc()}"]}, "result": (new_token,)}
 
         ts = int(time.time())
 
-        # ══ images tensor ══════════════════════════════════════════════
         try:
+            # ── images tensor ──────────────────────────────────────────
             if images is not None:
                 import torch
-                L(f"🖼 images type={type(images)}, ndim={getattr(images, 'ndim', '?')} shape={getattr(images, 'shape', '?')} dtype={getattr(images, 'dtype', '?')} ")
                 imgs = images
                 if isinstance(imgs, torch.Tensor) and imgs.ndim == 3:
                     imgs = imgs.unsqueeze(0)
@@ -258,47 +238,17 @@ class GoogleDriveUploadNode:
                 for i, img in enumerate(imgs):
                     fname = f"{filename_prefix}_{ts}_{i+1:03d}.png"
                     try:
-                        png = _tensor_to_png(img)
-                        L(f"🖼 {fname} конвертирован в PNG ({len(png)} байт)")
-                        url = _upload_bytes(svc, png, fname, folder_id)
+                        url = _upload_bytes(svc, _tensor_to_png(img), fname, folder_id)
                         L(f"✅ {fname} → {url}")
                     except Exception as e:
                         import traceback
-                        err = traceback.format_exc()
-                        print(f"[GDrive] UPLOAD ERROR {fname}:\n{err}")
-                        L(f"❌ {fname}: {e}\n{err}")
+                        L(f"❌ {fname}: {e}\n{traceback.format_exc()}")
 
-            # ══ source_path ════════════════════════════════════════════════
-            elif source_path:
-                paths_to_upload = []
-
-                if isinstance(source_path, list):
-                    # ComfyUI передал уже готовый list (напр. выход files ноды)
-                    paths_to_upload = [Path(p) for p in source_path]
-
-                elif isinstance(source_path, str) and source_path.strip():
-                    raw = source_path.strip()
-                    # попытка распарсить как JSON-строку
-                    try:
-                        parsed = json.loads(raw)
-                        if isinstance(parsed, list):
-                            paths_to_upload = [Path(p) for p in parsed]
-                        elif isinstance(parsed, str):
-                            paths_to_upload = [Path(parsed)]
-                        else:
-                            paths_to_upload = [Path(raw)]
-                    except (json.JSONDecodeError, ValueError):
-                        # обычный путь к файлу или папке
-                        p = Path(raw)
-                        if p.is_dir():
-                            paths_to_upload = sorted(f for f in p.iterdir() if f.is_file())
-                        else:
-                            paths_to_upload = [p]
-
-                L(f"📋 Файлов для загрузки: {len(paths_to_upload)}")
-
-                for fp in paths_to_upload:
-                    fp = Path(fp)
+            # ── source_path ────────────────────────────────────────────
+            elif source_path is not None and source_path != "":
+                paths = _resolve_paths(source_path)
+                L(f"📋 Файлов для загрузки: {len(paths)}")
+                for fp in paths:
                     if not fp.exists():
                         L(f"❌ Файл не найден: {fp}")
                         continue
@@ -311,18 +261,18 @@ class GoogleDriveUploadNode:
                     except Exception as e:
                         import traceback
                         L(f"❌ {fp.name}: {e}\n{traceback.format_exc()}")
+
             else:
-                L("⚠ Нет входных данных: подключи images или укажи source_path")
+                L("⚠ Нет входных данных: подключи images или source_path")
 
         except Exception as e:
             import traceback
             err = traceback.format_exc()
             print(f"[GDrive] НЕОБРАБОТАННАЯ ОШИБКА:\n{err}")
-            L(f"❌ Необработанная ошибка: {e}\n{err}")
+            L(f"❌ {e}\n{err}")
 
         return {"ui": {"text": ["\n".join(log)]}, "result": (new_token,)}
 
 
-# ── регистрация ────────────────────────────────────────────────────────────
 NODE_CLASS_MAPPINGS        = {"GoogleDriveUpload": GoogleDriveUploadNode}
 NODE_DISPLAY_NAME_MAPPINGS = {"GoogleDriveUpload": "📤 Google Drive Upload"}
