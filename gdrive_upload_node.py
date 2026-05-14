@@ -185,6 +185,9 @@ class GoogleDriveUploadNode:
                     "forceInput": True,
                     "tooltip": "Путь к файлу, папке или JSON-список путей.",
                 }),
+                "filenames": ("VHS_FILENAMES", {
+                    "tooltip": "Выход ноды Video Helper Suite (VHS). Формат: [bool, [path, ...]]",
+                }),
                 "filename_prefix": ("STRING", {
                     "default": "image",
                     "multiline": False,
@@ -200,6 +203,7 @@ class GoogleDriveUploadNode:
         oauth_token_in=None,
         images=None,
         source_path=None,
+        filenames=None,
         filename_prefix: str = "image",
     ):
         log = []
@@ -243,6 +247,32 @@ class GoogleDriveUploadNode:
                     except Exception as e:
                         import traceback
                         L(f"❌ {fname}: {e}\n{traceback.format_exc()}")
+
+            # ── VHS_FILENAMES ──────────────────────────────────────────
+            elif filenames is not None:
+                # формат: [bool, [path1, path2, ...]]
+                try:
+                    if isinstance(filenames, (list, tuple)) and len(filenames) == 2:
+                        file_list = filenames[1]
+                    elif isinstance(filenames, (list, tuple)):
+                        file_list = filenames
+                    else:
+                        file_list = []
+                    paths = [Path(p) for p in file_list if p]
+                except Exception as e:
+                    L(f"❌ Ошибка разбора filenames: {e}")
+                    paths = []
+                L(f"📋 filenames: {len(paths)} файлов")
+                for fp in paths:
+                    if not fp.exists():
+                        L(f"❌ Файл не найден: {fp}")
+                        continue
+                    try:
+                        url = _upload_file(svc, fp, folder_id)
+                        L(f"✅ {fp.name} → {url}")
+                    except Exception as e:
+                        import traceback
+                        L(f"❌ {fp.name}: {e}\n{traceback.format_exc()}")
 
             # ── source_path ────────────────────────────────────────────
             elif source_path is not None and source_path != "":
